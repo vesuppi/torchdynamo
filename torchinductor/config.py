@@ -55,3 +55,5 @@ class triton:
 
     # limit tiling dimensions
     max_tiles = 2
+    # enable codegen to use Triton's mm
+    use_mm = False
