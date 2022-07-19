@@ -7,6 +7,7 @@ import sys
 import traceback
 import types
 import typing
+import weakref
 from typing import Callable
 
 import torch
@@ -19,18 +20,22 @@ from .bytecode_analysis import remove_dead_code
 from .bytecode_analysis import remove_pointless_jumps
 from .bytecode_transformation import is_generator
 from .bytecode_transformation import transform_code_object
+from .eval_frame import TorchPatcher
 from .eval_frame import WrapperBackend
 from .eval_frame import always_optimize_code_objects
 from .eval_frame import skip_code
+from .exc import BackendCompilerFailed
 from .exc import InternalTorchDynamoError
 from .exc import TorchRuntimeError
 from .exc import Unsupported
 from .exc import unimplemented
+from .guards import CheckFunctionManager
 from .guards import GuardedCode
 from .symbolic_convert import InstructionTranslator
 from .utils import CleanupManager
 from .utils import counters
 from .utils import guard_failures
+from .utils import init_logging
 from .utils import is_namedtuple
 from .utils import istype
 from .utils import orig_code_map
@@ -44,10 +49,12 @@ class Tracker:
         self.seen = []
         self.seen_ids = set()
 
-    def add(self, obj):
-        if obj not in self:
+    def add(self, strong_obj):
+        idx = id(strong_obj)
+        if idx not in self.seen_ids:
+            obj = weakref.ref(strong_obj, lambda _: self.seen_ids.remove(idx))
             self.seen.append(obj)
-            self.seen_ids.add(id(obj))
+            self.seen_ids.add(idx)
 
     def __contains__(self, item):
         return id(item) in self.seen_ids
@@ -108,9 +115,9 @@ def wrap_convert_context(fn):
     @functools.wraps(fn)
     def _fn(*args, **kwargs):
         prior_grad_mode = torch.is_grad_enabled()
-        rng_state = torch.clone(torch.random.get_rng_state())
+        rng_state = torch.random.get_rng_state()
         if torch.cuda.is_available():
-            cuda_rng_state = torch.clone(torch.cuda.get_rng_state())
+            cuda_rng_state = torch.cuda.get_rng_state()
         prior_fwd_from_src = torch.fx.graph_module._forward_from_src
         torch.fx.graph_module._forward_from_src = fx_forward_from_src_skip_result
         try:
@@ -125,6 +132,7 @@ def wrap_convert_context(fn):
     return _fn
 
 
+@TorchPatcher.suppress_torch_distributed_warnings
 def has_tensor_in_frame(frame):
     """Check if the frame has torch.* related bits"""
     # Check if the function was decorated with torchdynamo.optimize
@@ -161,7 +169,11 @@ def has_tensor_in_frame(frame):
         elif is_namedtuple(obj):
             seen_ids[obj_id] = any([has_tensor(getattr(obj, v)) for v in obj._fields])
             return seen_ids[obj_id]
-        elif hasattr(obj, "__dict__") and len(getattr(obj, "__dict__")):
+        elif (
+            not is_allowed(obj)
+            and hasattr(obj, "__dict__")
+            and len(getattr(obj, "__dict__"))
+        ):
             seen_ids[obj_id] = any([has_tensor(v) for v in obj.__dict__.values()])
             return seen_ids[obj_id]
         else:
@@ -186,8 +198,10 @@ def has_tensor_in_frame(frame):
     return False
 
 
-def convert_frame_assert(compiler_fn: Callable, one_graph=True):
+def convert_frame_assert(compiler_fn: Callable, guard_export_fn=None, one_graph=True):
     """Fully convert a frame into an FX graph"""
+    init_logging()
+
     compiler_fn = wrap_compiler_fn(compiler_fn)
 
     def _convert_frame_assert(frame: types.FrameType, cache_size: int):
@@ -201,7 +215,7 @@ def convert_frame_assert(compiler_fn: Callable, one_graph=True):
         ):
             return None
         if code.co_name == "<genexpr>" and code.co_filename.endswith(
-            "transformers/file_utils.py"
+            ("transformers/file_utils.py", "transformers/utils/generic.py")
         ):
             # not needed, but cleans up torchbench error stats
             return None
@@ -215,6 +229,15 @@ def convert_frame_assert(compiler_fn: Callable, one_graph=True):
         if code.co_name == "<module>" and code.co_filename == "<string>":
             return None
 
+        if (
+            code.co_name == "<lambda>"
+            and code.co_filename == "<string>"
+            and not bool(frame.f_builtins)
+        ):
+            # namedtuple subclass constructor. Empty builtins cause issue with
+            # len keyword in LIST_LEN guard.
+            return None
+
         if is_generator(code):
             unimplemented("generator")
         if cache_size >= config.cache_size_limit:
@@ -223,13 +246,15 @@ def convert_frame_assert(compiler_fn: Callable, one_graph=True):
                 return f"'{code.co_name}' ({code.co_filename}:{code.co_firstlineno})"
 
             def format_guard_failures(code):
-                return f"{str(guard_failures[code])}"
+                # For the common case, it's sufficient to see just the most recent failure.
+                # We could add a verbose mode if needed
+                return f"{str(guard_failures[code][-1])}"
 
             assert code in guard_failures, "TODO(whc) any other recompile reasons?"
             log.warning(
-                f"torchdynamo hit recompilation cache limit ({config.cache_size_limit}) "
-                f"for function {format_func_info(code)}, "
-                f"due to the following guard failures: {format_guard_failures(code)}"
+                f"torchdynamo hit config.cache_size_limit ({config.cache_size_limit})\n"
+                f"   function: {format_func_info(code)}\n"
+                f"   reasons:  {format_guard_failures(code)}\n"
                 f"to diagnose recompilation issues, see {troubleshooting_url}."
             )
             unimplemented("cache_size_limit reached")
@@ -290,33 +315,47 @@ def convert_frame_assert(compiler_fn: Callable, one_graph=True):
                 print("MODIFIED BYTECODE")
                 # print(dis.Bytecode(code).info())
                 print(dis.Bytecode(code).dis())
+
+            assert output.guards is not None
+            CleanupManager.instance[code] = output.cleanups
+            check_fn = CheckFunctionManager(
+                output.guards, frame.f_locals, frame.f_globals
+            )
+            guarded_code = GuardedCode(code, check_fn.check_fn)
+            if config.debug:
                 print("\nGUARDS:")
                 for guard in sorted(output.guards):
                     print(" -", str(guard))
                 print()
-            assert output.guards is not None
-            CleanupManager.instance[code] = output.cleanups
-            return GuardedCode(code, output.guards, frame.f_locals, frame.f_globals)
-        except (Unsupported, TorchRuntimeError):
-            debug_print("WONT CONVERT")
+
+            if guard_export_fn is not None:
+                guard_export_fn(output.guards)
+
+            return guarded_code
+        except (Unsupported, TorchRuntimeError, BackendCompilerFailed):
+            if config.debug or config.trace or config.print_internal_exceptions:
+                debug_print("WONT CONVERT")
             raise
         except Exception:
-            debug_print("WONT CONVERT")
-            sys.stderr.write("=" * 10 + " TorchDynamo Stack Trace " + "=" * 10 + "\n")
-            traceback.print_exc()
-            sys.stderr.write(
-                "=" * 10 + " Exception (above) while processing " + "=" * 10 + "\n"
-            )
-            traceback.print_stack(frame)
-            sys.stderr.write("=" * 10 + " End debug info " + "=" * 10 + "\n")
+            if config.debug or config.trace or config.print_internal_exceptions:
+                debug_print("WONT CONVERT")
+                sys.stderr.write(
+                    "=" * 10 + " TorchDynamo Stack Trace " + "=" * 10 + "\n"
+                )
+                traceback.print_exc()
+                sys.stderr.write(
+                    "=" * 10 + " Exception (above) while processing " + "=" * 10 + "\n"
+                )
+                traceback.print_stack(frame)
+                sys.stderr.write("=" * 10 + " End debug info " + "=" * 10 + "\n")
             raise InternalTorchDynamoError()
 
     return wrap_convert_context(_convert_frame_assert)
 
 
-def convert_frame(compiler_fn: typing.Callable):
+def convert_frame(compiler_fn: typing.Callable, guard_export_fn=None):
     """Try to convert a frame into an FX graph, if error leave frame unmodified"""
-    inner_convert = convert_frame_assert(compiler_fn, one_graph=False)
+    inner_convert = convert_frame_assert(compiler_fn, guard_export_fn, one_graph=False)
 
     def _convert_frame(frame: types.FrameType, cache_size: int):
         counters["frames"]["total"] += 1
@@ -324,6 +363,8 @@ def convert_frame(compiler_fn: typing.Callable):
             result = inner_convert(frame, cache_size)
             counters["frames"]["ok"] += 1
             return result
+        except BackendCompilerFailed:
+            raise
         except Exception:
             pass
         return None

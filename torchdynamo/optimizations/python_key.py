@@ -44,7 +44,26 @@ def debug_node(n: Node):
     return f"{n.op} {target} {n.args} {n.kwargs}"
 
 
-def python_key_normalize(gm: torch.fx.GraphModule, example_inputs, decompositions={}):
+# TODO: remove, copied from functorch
+def strip_overloads(gm):
+    """
+    Modifies the target of graph nodes in :attr:`gm` to strip overloads.
+    Args:
+        gm(fx.GraphModule): The input Fx graph module to be modified
+    """
+    for node in gm.graph.nodes:
+        if isinstance(node.target, torch._ops.OpOverload):
+            node.target = node.target.overloadpacket
+    gm.recompile()
+
+
+def python_key_normalize(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    decompositions={},
+    python_tensor_cls=None,
+    post_trace_hook=None,
+):
     """
     Use AOT autograd for normalizing IR in inference mode.  This is useful
     for debugging and gives us a common IR for both eval and train modes.
@@ -54,7 +73,12 @@ def python_key_normalize(gm: torch.fx.GraphModule, example_inputs, decomposition
     from functorch._src.named_members_polyfill import _named_buffers
     from functorch._src.named_members_polyfill import _named_parameters
     from functorch._src.python_key import PythonKeyTracer
-    from functorch._src.python_key import PythonTensor
+
+    if not python_tensor_cls:
+        from functorch._src.python_key import PythonTensor
+
+        python_tensor_cls = PythonTensor
+
     from functorch._src.python_key import pythonkey_decompose
 
     example_inputs = clone_inputs(example_inputs)
@@ -66,6 +90,7 @@ def python_key_normalize(gm: torch.fx.GraphModule, example_inputs, decomposition
         **dict(_named_parameters(gm, remove_duplicate=False)),
         **dict(_named_buffers(gm, remove_duplicate=False)),
     }
+
     params_flat, params_spec = pytree.tree_flatten(params)
     params_flat = tuple(params_flat)
     params_len = len(params_flat)
@@ -83,7 +108,7 @@ def python_key_normalize(gm: torch.fx.GraphModule, example_inputs, decomposition
                         # Tensor creation ops won't be captured because none
                         # of their inputs are PythonTensor proxies.
                         # Explicitly add them to the output graph.
-                        result = PythonTensor(
+                        result = python_tensor_cls(
                             result,
                             tracer.create_proxy(n.op, n.target, n.args, n.kwargs),
                         )
@@ -105,23 +130,37 @@ def python_key_normalize(gm: torch.fx.GraphModule, example_inputs, decomposition
     def fn_for_tracing(*proxy_args):
         assert len(proxy_args) == nargs
         args = [
-            PythonTensor(elem, proxy)
+            python_tensor_cls(elem, proxy)
             for elem, proxy in zip(chain(params_flat, example_inputs), proxy_args)
         ]
         with _stateless.reparametrize_module(
             gm, pytree.tree_unflatten(args[:params_len], params_spec)
         ):
             out = PatchingInterpreter(gm).run(*args[params_len:])
+
         assert isinstance(out, (tuple, list)), "graph must output tuple()"
-        return tuple(x.proxy for x in out)
+
+        def unpack(x):
+            if hasattr(x, "proxy"):
+                return x.proxy
+            return x
+
+        return tuple(unpack(x) for x in out)
 
     with pythonkey_decompose({**aot_autograd_decompositions, **decompositions}):
         tracer: torch.fx.Tracer = PythonKeyTracer()
         graph = tracer.trace(fake_signature(fn_for_tracing, nargs))
         traced = GraphModule(tracer.root, graph, "python_key_traced")
+        # https://github.com/pytorch/pytorch/pull/80013 switched over
+        # tracing to trace op overloads, however op lowerings are currently
+        # registered to the overload packet. TODO: switch over to registering
+        # to overloads after branch cut for 1.12
+        strip_overloads(traced)
 
     traced.recompile()
     # record_graph_stats(traced)
+    if post_trace_hook is not None:
+        post_trace_hook(tracer, graph)
 
     def make_wrapper(inner):
         def call_fn(*args):
