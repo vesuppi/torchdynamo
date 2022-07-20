@@ -6,7 +6,7 @@ from torchinductor.triton_ops.blocksparse.utils import *
 
 
 @triton.jit
-def _kernel1(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals, 
+def _kernel_ragged(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals, 
             M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
             BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, 
             nBM: tl.constexpr, nBK: tl.constexpr, nBN: tl.constexpr,
@@ -67,12 +67,12 @@ def _kernel1(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals,
     tl.store(c_ptrs, c)
 
 
-def bmm1(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
+def bmm_ragged(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
     nBM = cdiv(M, BM)
     nBN = cdiv(N, BN)
     nBK = cdiv(K, BK)
     grid = (nBM, nBN, B)
-    binary = _kernel1[grid](a_mask_rowptrs, a_cols, a_vals, b_vals, c,
+    binary = _kernel_ragged[grid](a_mask_rowptrs, a_cols, a_vals, b_vals, c,
                             M, K, N, 
                             BM, BK, BN, nBM, nBK, nBN, 
                             num_warps=num_warps, num_stages=num_stages
@@ -83,7 +83,7 @@ def bmm1(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_
 
 ## This kernel is to test the impact of `tl.swizzle2d`, which doesn't seem to make a difference
 @triton.jit
-def _kernel2(a_cols, a_vals, b_vals, c_vals, 
+def _kernel_with_swizzle2d(a_cols, a_vals, b_vals, c_vals, 
             M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
             BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, 
             nBM: tl.constexpr, nBK: tl.constexpr, nBN: tl.constexpr,
@@ -142,12 +142,12 @@ def _kernel2(a_cols, a_vals, b_vals, c_vals,
     tl.store(c_ptrs, c)
 
 
-def bmm2(B, M, K, N, BM, BK, BN, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
+def bmm_with_swizzle2d(B, M, K, N, BM, BK, BN, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
     nBM = cdiv(M, BM)
     nBN = cdiv(N, BN)
     nBK = cdiv(K, BK)
     grid = (nBM, nBN, B)
-    binary = _kernel2[grid](a_cols, a_vals, b_vals, c,
+    binary = _kernel_with_swizzle2d[grid](a_cols, a_vals, b_vals, c,
                             M, K, N, 
                             BM, BK, BN, nBM, nBK, nBN, GROUP_SIZE_M=4,
                             num_warps=num_warps, num_stages=num_stages
@@ -160,7 +160,7 @@ def bmm2(B, M, K, N, BM, BK, BN, a_cols, a_vals, b_vals, c, num_warps=4, num_sta
 ## This is to test the effect of reuse by calculating two blocks per thread.
 ## Wasn't able to create a working implementation, currently buggy and don't know why
 @triton.jit
-def _kernel3(a_cols, a_vals, b_vals, c_vals, 
+def _kernel_2blocks(a_cols, a_vals, b_vals, c_vals, 
             M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
             BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, 
             nBM: tl.constexpr, nBK: tl.constexpr, nBN: tl.constexpr,
@@ -231,13 +231,13 @@ def _kernel3(a_cols, a_vals, b_vals, c_vals,
     #tl.store(c1_ptrs, c0)
 
 
-def bmm3(B, M, K, N, BM, BK, BN, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
+def bmm_2blocks(B, M, K, N, BM, BK, BN, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
     nBM = cdiv(M, BM)
     nBN = cdiv(N, BN)
     nBK = cdiv(K, BK)
     grid = (nBM, nBN, B)
-    print('grid:', grid)
-    binary = _kernel3[grid](a_cols, a_vals, b_vals, c,
+    #print('grid:', grid)
+    binary = _kernel_2blocks[grid](a_cols, a_vals, b_vals, c,
                             M, K, N, 
                             BM, BK, BN, nBM, nBK, nBN, 
                             num_warps=num_warps, num_stages=num_stages
@@ -246,10 +246,10 @@ def bmm3(B, M, K, N, BM, BK, BN, a_cols, a_vals, b_vals, c, num_warps=4, num_sta
     return c
 
 
-## This is to test the effect of having a CSR-ragger format. 
+## This is to test the effect of having a CSR-ragged format. 
 ## Results show that the use of two level loop seems to have a perf hit.
 @triton.jit
-def _kernel4(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals, 
+def _kernel_ragged_outer_csr(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals, 
             M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
             BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, 
             nBM: tl.constexpr, nBK: tl.constexpr, nBN: tl.constexpr,
@@ -308,12 +308,12 @@ def _kernel4(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals,
     tl.store(c_ptrs, c)
 
 
-def bmm4(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
+def bmm_ragged_outer_csr(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
     nBM = cdiv(M, BM)
     nBN = cdiv(N, BN)
     nBK = cdiv(K, BK)
     grid = (nBM, nBN, B)
-    binary = _kernel4[grid](a_mask_rowptrs, a_cols, a_vals, b_vals, c,
+    binary = _kernel_ragged_outer_csr[grid](a_mask_rowptrs, a_cols, a_vals, b_vals, c,
                             M, K, N, 
                             BM, BK, BN, nBM, nBK, nBN, 
                             num_warps=num_warps, num_stages=num_stages
@@ -326,7 +326,7 @@ def bmm4(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_
 ## This is to test a new format, which is more general than just ragged, which uses a slow
 ## path and a fast path. The fast path is ragged and the slow path is CSR (to be completed)
 @triton.jit
-def _kernel5(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals, 
+def _kernel_hybrid(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals, 
             M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
             BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, 
             nBM: tl.constexpr, nBK: tl.constexpr, nBN: tl.constexpr,
@@ -380,12 +380,12 @@ def _kernel5(a_mask_rowptrs, a_cols, a_vals, b_vals, c_vals,
     tl.store(c_ptrs, c)
 
 
-def bmm5(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
+def bmm(B, M, K, N, BM, BK, BN, a_mask_rowptrs, a_cols, a_vals, b_vals, c, num_warps=4, num_stages=3):
     nBM = cdiv(M, BM)
     nBN = cdiv(N, BN)
     nBK = cdiv(K, BK)
     grid = (nBM, nBN, B)
-    binary = _kernel5[grid](a_mask_rowptrs, a_cols, a_vals, b_vals, c,
+    binary = _kernel_hybrid[grid](a_mask_rowptrs, a_cols, a_vals, b_vals, c,
                             M, K, N, 
                             BM, BK, BN, nBM, nBK, nBN, 
                             num_warps=num_warps, num_stages=num_stages

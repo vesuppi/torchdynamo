@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from torchinductor.triton_ops.blocksparse.utils import *
 from torchinductor.triton_ops.blocksparse.mmconfigs import basic_configs
-from torchinductor.triton_ops.blocksparse.spmm import bmm5 as kernel
+from torchinductor.triton_ops.blocksparse.spmm import bmm as kernel
 from torchinductor.triton_ops.batched_matmul import bmm_out
 
     
@@ -69,6 +69,9 @@ def test_lower_triangular(B, M, K, N, is_tril=True, runtime_log=sys.stdout):
     
 
 def test_post_shapes_lower_tri(test_dense=False):
+    '''
+    Test shapes come from post: https://fb.workplace.com/notes/172268385155581/. 
+    '''
     runtime_log = open(f'results/post.log', 'w')
     print(f'# Test post shapes, also test dense case: {test_dense}', file=runtime_log)
     shapes = [
