@@ -135,6 +135,8 @@ def to_block_format_with_mask_bmm_one_mask(a, BLOCK_M: int, BLOCK_N: int):
             res[:, m, n, 0: BLOCK_M, 0: BLOCK_N] = block
             if torch.count_nonzero(block) == 0:
                 mask[m, n] = 0
+            elif torch.all(block == -torch.inf):
+                mask[m, n] = 0
     return (res, mask)
 
 

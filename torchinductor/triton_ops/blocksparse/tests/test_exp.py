@@ -12,6 +12,7 @@ def bench_triton_exp(a):
         for BN in [16, 32, 64]:
             a_data, a_mask = to_block_format_with_mask_bmm_one_mask(a, BM, BN)
             a_mask = RaggedFormat.from_dense_mask(a_mask)
+            a_mask.default = -torch.inf
             b_mask, b_data = kernel(a_mask, a_data)
             b_dense = b_mask.to_dense(b_data)
             assert torch.allclose(torch.exp(a), b_dense), \

@@ -1,5 +1,6 @@
 import sys
 import torch
+import numpy as np
 import triton 
 import triton.language as tl
 from torchinductor.triton_ops.blocksparse.utils import *
@@ -124,6 +125,6 @@ def kernel(x_mask: RaggedFormat, x_data):
     )
     # Same mask is used for y
     y_mask = x_mask.copy()
-    y_mask.default = torch.exp(x_mask.default)
+    y_mask.default = np.exp(x_mask.default)
     return (y_mask, y_data)
 
