@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 import triton.testing
 from triton.ops.matmul import matmul as triton_matmul
-from utils import *
+from torchinductor.triton_ops.blocksparse.utils import *
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -12,7 +12,6 @@ VERIFY = False
 
 print_naive_PTX = False
 print_block_PTX = False
-
 
 
 @triton.jit
@@ -181,102 +180,6 @@ def run_normal_triton(a, b, M, K, N):
     ms, _, _ = triton.testing.do_bench(lambda: triton_matmul(a, b))
     return ms
 
-def run_regular_shapes():
-    torch.manual_seed(0)
-    M = 64
-    K = 128
-    N = 256
-    BLOCK = 32
-
-    # dtype = torch.float16
-    # for M in [2048, 4096]:
-    #     for N in [2048, 4096]:
-    #         for K in [2048, 4096]:
-    #         #for K in [4096*2]:
-    #             a = torch.randn((M, K), device="cuda", dtype=dtype)
-    #             b = torch.randn((K, N), device="cuda", dtype=dtype)
-
-    #             ms1 = run_torch(a, b, M, K, N)
-    #             ms2 = run_triton(a, b, M, K, N, 64, 64, 64)
-    #             FLOPS1 = 2 * M * K * N / ms1 / 10**9
-    #             FLOPS2 = 2 * M * K * N / ms2 / 10**9
-    #             print(M, K, N, ms1, FLOPS1, FLOPS1/312, ms2, FLOPS2, FLOPS2/312)
-    # sys.exit(0)
-
-    # for shape in [(128, 4096, 1000)]:
-    #     M, K, N = shape
-    #     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
-    #     b = torch.randn((K, N), device="cuda", dtype=a.dtype)
-    #     ms1 = run_torch(a, b, M, K, N)
-    #     for blocks in [(64, 64, 64)]:
-    #         BLOCK_M, BLOCK_K, BLOCK_N = blocks
-    #         ms2 = run_triton(a, b, M, K, N, BLOCK_M, BLOCK_K, BLOCK_N)
-    #         print(ms1, ms2)
-
-    # return
-    i = 0
-    for dtype in [torch.float16, torch.float32]:
-        for M in [512, 1024, 64, 128, 256]:
-            for N in [512, 1024, 64, 128, 256]:
-                #for K in [1024, 512, 64, 128, 256]:
-                for K in [512, 1024, 64, 128, 256]:
-                    # print(f'info: shape: {M} x {K} x {N}')
-                    a = torch.randn((M, K), device="cuda", dtype=dtype)
-                    b = torch.randn((K, N), device="cuda", dtype=dtype)
-
-                    #a_1 = torch.randn((M-1, K-1), device="cuda", dtype=dtype)
-                    #b_1 = torch.randn((K-1, N-1), device="cuda", dtype=dtype)
-
-
-                    ms0 = run_normal_triton(a, b, M, K, N)
-                    ms1 = run_torch(a, b, M, K, N)
-                    #print(f'info: torch mm: {ms1}')
-                    
-                    #continue
-                    triton_times2 = []
-                    triton_times3 = []
-
-                    for BLOCK_M in [256, 32, 64, 128]:
-                        for BLOCK_K in [32, 64, 128]:
-                            for BLOCK_N in [32, 64, 128]:
-                                #print(f'info: BM: {BLOCK_M}, BK: {BLOCK_K}, BN: {BLOCK_N}')
-                                if BLOCK_M > M or BLOCK_K > K or BLOCK_N > N:
-                                    continue
-                                
-                                ms2 = torch.inf
-                                try:
-                                    ms2 = run_triton_block_mm(a, b, M, K, N, BLOCK_M, BLOCK_K, BLOCK_N)
-                                except Exception as e:
-                                    print(e)
-                                    pass
-                                ms3 = torch.inf
-                                try:    
-                                    pass
-                                    ms3 = run_triton_naive_mm(a, b, M, K, N, BLOCK_M, BLOCK_K, BLOCK_N)
-                                except:
-                                    pass
-
-                                #print(f'info: naive mm: {ms3}, block mm: {ms2}') 
-                                
-                                triton_times2.append((ms2, (BLOCK_M, BLOCK_K, BLOCK_N)))
-                                triton_times3.append((ms3, (BLOCK_M, BLOCK_K, BLOCK_N)))
-                                #sys.exit(1)
-
-                    triton_times2.sort(key=lambda x: x[0])
-                    triton_times3.sort(key=lambda x: x[0])
-                    
-                    print(f'{M} x {K} x {N}', end='; ')
-                    print(f'{ms0:.4f}; {ms1:.4f}', end='; ')
-                    for i in range(1):
-                        ms, blocks = triton_times2[i]
-                        print(f'{ms:.4f}; {blocks}', end='; ')
-
-                        ms, blocks = triton_times3[i]
-                        print(f'{ms:.4f}; {blocks}', end='; ')
-                    print()
-                    sys.stdout.flush()
-                    #sys.exit(1)
-
 
 def benchmark(shapes, dtypes):
     for dtype in dtypes:
@@ -353,6 +256,7 @@ def run_regular_shapes():
             for K in [512, 1024, 64, 128, 256]:
                 shapes.append([M, K, N])
     benchmark(shapes, [torch.float16, torch.float32])
+
 
 if __name__ == "__main__":
     check_block_format_utils()
