@@ -1,6 +1,8 @@
+import dataclasses
 import os
 import traceback
 
+import torchdynamo.config as config
 from torchdynamo.utils import counters
 
 
@@ -18,6 +20,23 @@ class SkipFrame(RuntimeError):
 
 class TorchRuntimeError(RuntimeError):
     pass
+
+
+@dataclasses.dataclass
+class FakeTensorError(RuntimeError):
+    reason: str
+
+
+class BackendCompilerFailed(RuntimeError):
+    def __init__(self, backend_fn, inner_exception):
+        self.backend_name = getattr(backend_fn, "__name__", "?")
+        self.inner_exception = inner_exception
+        super().__init__(
+            f"{self.backend_name} raised {type(inner_exception).__name__}: {inner_exception}"
+            "\n\n"
+            "You can suppress this exception and fall back to eager by setting:\n"
+            "    torchdynamo.config.raise_on_backend_error = False"
+        )
 
 
 class Unsupported(RuntimeError):
@@ -48,6 +67,8 @@ class Unsupported(RuntimeError):
 
 
 def unimplemented(msg: str):
+    if config.debug:
+        print("Unimplemented - causing graph break:", msg)
     assert msg != os.environ.get("BREAK", False)
     raise Unsupported(msg)
 

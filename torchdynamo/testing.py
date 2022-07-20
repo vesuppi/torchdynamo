@@ -16,6 +16,7 @@ from .bytecode_transformation import create_instruction
 from .bytecode_transformation import debug_checks
 from .bytecode_transformation import is_generator
 from .bytecode_transformation import transform_code_object
+from .guards import CheckFunctionManager
 from .guards import GuardedCode
 from .utils import same
 
@@ -67,7 +68,7 @@ def reduce_to_scalar_loss(out):
         return sum([reduce_to_scalar_loss(value) for value in out.values()]) / len(
             out.keys()
         )
-    raise NotImplementedError("Don't know how to reduce")
+    raise NotImplementedError("Don't know how to reduce", type(out))
 
 
 def debug_dir():
@@ -97,7 +98,7 @@ def debug_insert_nops(frame, cache_size):
     debug_checks(frame.f_code)
     code = transform_code_object(frame.f_code, insert_nops)
 
-    return GuardedCode(code)
+    return GuardedCode(code, CheckFunctionManager().check_fn)
 
 
 class CompileCounter:

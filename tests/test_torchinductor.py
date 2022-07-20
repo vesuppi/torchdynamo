@@ -3,6 +3,7 @@ import contextlib
 import dataclasses
 import functools
 import importlib
+import random
 import unittest
 from unittest.mock import patch
 
@@ -28,6 +29,7 @@ try:
     from torchinductor.ir import IndexingDiv
     from torchinductor.ir import ModularIndexing
     from torchinductor.sizevars import SizeVarAllocator
+    from torchinductor.utils import has_torchvision_roi_align
 
     # This will only pass on pytorch builds newer than roughly 5/15/2022
     assert get_decompositions([torch.ops.aten.trace])
@@ -58,6 +60,21 @@ if torch.cuda.is_available():
 
 requires_cuda = functools.partial(unittest.skipIf, not HAS_CUDA, "requires cuda")
 torchinductor.config.triton.autotune = False  # too slow
+
+
+def requires_decomp(fn):
+    """Decorator to disable test if a decomp is missing"""
+
+    def wrap_test(test):
+        @functools.wraps(test)
+        def maybe_test(*args, **kwargs):
+            if len(get_decompositions([fn])) == 0:
+                raise unittest.SkipTest(f"requires decomp for {fn.__name__}")
+            return test(*args, **kwargs)
+
+        return maybe_test
+
+    return wrap_test
 
 
 class TestCase(unittest.TestCase):
@@ -127,11 +144,14 @@ def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True
     if has_lowp_args:
         if hasattr(model, "to"):
             model = model.to(torch.float)
+    torch.manual_seed(0)
     correct = model(*upcasted_inputs)
     # downcast the model back if needed
     if has_lowp_args:
         if hasattr(model, "to"):
             model = model.to(torch.half)
+
+    torchinductor.metrics.reset()
 
     @torchdynamo.optimize_assert(functools.partial(compile_fx, cudagraphs=False))
     def run(*ex):
@@ -139,6 +159,7 @@ def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True
 
     torchdynamo.reset()
     with unittest.mock.patch("torchdynamo.config.raise_on_backend_error", True):
+        torch.manual_seed(0)
         actual = run(*example_inputs)
 
     assert type(actual) == type(correct)
@@ -149,6 +170,10 @@ def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True
         for x, y in zip(actual_flat, correct_flat)
     )
     correct = tree_unflatten(correct_flat, correct_spec)
+
+    # print(correct)
+    # print(actual)
+    # print(correct - actual)
     self.assertTrue(same(actual, correct, tol=tol, equal_nan=True))
 
 
@@ -370,6 +395,29 @@ class CommonTemplate:
 
         self.common(fn, (torch.randn(8, 16, 8), torch.randn(8, 16), torch.randn(16, 8)))
 
+    def test_vertical_fusion1(self):
+        def fn(sa, ct, p):
+            # From torchbench.pyhpc_equation_of_state
+            v17 = -3.087032500374211e-7
+            v18 = -1.988366587925593e-8
+            v19 = -1.061519070296458e-11
+            v20 = 1.550932729220080e-10
+            t15 = v19 * ct
+            t19 = v17 + ct * (v18 + t15) + v20 * sa
+            t20 = 1.0 / t19
+            t128 = t19 * p
+            return t20 + t128
+
+        self.common(
+            fn,
+            (
+                torch.randn(204, 204, 26),
+                torch.randn(204, 204, 26),
+                torch.randn(26),
+            ),
+        )
+        self.assertEqual(torchinductor.metrics.generated_kernel_count, 1)
+
     def test_sum1(self):
         def fn(a, b):
             return ((a + b).sum(-1),)
@@ -412,6 +460,16 @@ class CommonTemplate:
             return (f,)
 
         self.common(fn, (torch.randn(1, 17, 8, 9),))
+
+    def test_multilayer_low_prec(self):
+        # fp16 nyi for cpu
+        if self.device == "cpu":
+            raise unittest.SkipTest("requires CUDA")
+
+        def fn(a):
+            return torch.mean(a)
+
+        self.common(fn, ((torch.rand((10, 3, 352, 352), dtype=torch.float16),)))
 
     def test_min_max_reduction(self):
         def fn(a, b):
@@ -542,9 +600,28 @@ class CommonTemplate:
         def fn(a, b):
             return torch.round(a), torch.round(b + 1), torch.round(a, decimals=2)
 
+        # without manual_seed, there is some chance this test fails due to:
+        # https://github.com/openai/triton/issues/530
+        torch.manual_seed(0)
+
         # with *100 we are always getting a number exactly at .5 which we don't do right in half
+        self.common(fn, (torch.randn(8, 8) * 100, torch.randn(8, 8) * 10))
+
+    def test_round_correctness(self):
+        if self.device == "cuda" and (
+            not torchinductor.utils.has_triton_libdevice()
+            # TODO(jansel): need to debug issue on V100 cards
+            or torch.cuda.get_device_capability() < (8,)
+        ):
+            raise unittest.SkipTest("requires triton.language.libdevice")
+
+        def fn(a):
+            return torch.round(a)
+
         self.common(
-            fn, (torch.randn(8, 8) * 100, torch.randn(8, 8) * 10), check_lowp=False
+            fn,
+            [torch.arange(-10, 10, 0.1, dtype=torch.float64)],
+            check_lowp=False,
         )
 
     def test_silu(self):
@@ -723,7 +800,7 @@ class CommonTemplate:
         )
         self.common(mod, (torch.randn(2, 8),))
 
-    def test_bmm(self):
+    def test_bmm1(self):
         def fn(a, b):
             return (
                 torch.bmm(a, b),
@@ -743,6 +820,19 @@ class CommonTemplate:
             (
                 torch.randn(1, 16, 8),
                 torch.randn(1, 8, 10),
+            ),
+            check_lowp=False,
+        )
+
+    def test_bmm2(self):
+        def fn(a, b):
+            return torch.bmm(a.permute(0, 2, 1), b)
+
+        self.common(
+            fn,
+            (
+                torch.randn(1, 8, 8),
+                torch.randn(1, 8, 8),
             ),
             check_lowp=False,
         )
@@ -815,6 +905,7 @@ class CommonTemplate:
                 aten._to_copy(a, dtype=6),
                 aten._to_copy(b + 1, dtype=6),
                 aten.to(b, torch.float64),
+                aten.to(b, torch.bool),
             )
 
         self.common(
@@ -1057,6 +1148,24 @@ class CommonTemplate:
             (torch.randn([16, 16]),),
         )
 
+    def test_cos(self):
+        def fn(x):
+            return aten.cos(x) + 2, aten.cos(x + 1)
+
+        self.common(
+            fn,
+            (torch.randn([16, 16]),),
+        )
+
+    def test_sin(self):
+        def fn(x):
+            return aten.sin(x) + 2, aten.sin(x + 1)
+
+        self.common(
+            fn,
+            (torch.randn([16, 16]),),
+        )
+
     def test_repeat(self):
         def fn(x):
             return (
@@ -1121,8 +1230,36 @@ class CommonTemplate:
         self.assertEqual(c.stride()[2], 1)
 
     @requires_cuda()
-    @patch.object(config.triton, "use_conv", True)
+    @patch.object(config.triton, "convolution", "triton")
+    @patch.object(config.triton, "dense_indexing", "True")
     def test_triton_conv(self):
+        @torchdynamo.optimize("inductor", nopython=True)
+        def triton_conv(
+            x,
+            w,
+            bias,
+            stride,
+            padding,
+            dilation,
+            groups,
+        ):
+            y = torch.conv2d(x, w, bias, stride, padding, dilation, groups)
+            return y
+
+        stride, padding, dilation, groups = (1, 1), (0, 0), (1, 1), 1
+        dtype = torch.float32
+        x = torch.randn((32, 128, 32, 32), dtype=dtype, device=self.device)
+        w = torch.randn((32, 128, 1, 1), dtype=dtype, device=self.device)
+        bias = torch.randn((32), dtype=dtype, device=self.device)
+
+        y = triton_conv(x, w, bias, stride, padding, dilation, groups)
+        y_correct = torch.conv2d(x, w, bias, stride, padding, dilation, groups)
+        self.assertTrue(same(y, y_correct, cos_similarity=True, tol=0.1))
+
+    @requires_cuda()
+    @patch.object(config.triton, "convolution", "autotune")
+    @patch.object(config.triton, "dense_indexing", "True")
+    def test_conv_autotune(self):
         @torchdynamo.optimize("inductor", nopython=True)
         def triton_conv(
             x,
@@ -1334,6 +1471,15 @@ class CommonTemplate:
             (torch.randn([8, 8]) + 10,),
         )
 
+    def test_log_fp64(self):
+        def fn(x):
+            return torch.log(x), torch.log2(x)
+
+        self.common(
+            fn,
+            (torch.randn([1024], dtype=torch.float64) + 10,),
+        )
+
     def test_bitwise(self):
         def fn(x, y):
             return (
@@ -1471,6 +1617,8 @@ class CommonTemplate:
             ),
         )
 
+    # https://github.com/pytorch/torchdynamo/issues/467
+    @patch.object(torchdynamo.config, "fake_tensor_propagation", False)
     def test_cudnn_rnn(self):
         if self.device == "cpu":
             raise unittest.SkipTest("requires CUDA")
@@ -1756,6 +1904,26 @@ class CommonTemplate:
             ),
         )
 
+    @unittest.skipIf(not has_torchvision_roi_align(), "requirs torchvision")
+    def test_roi_align(self):
+        def fn(a, b):
+            return torch.ops.torchvision.roi_align(a, b, 0.25, 7, 7, 2, False)
+
+        self.common(fn, (torch.zeros([4, 256, 296, 304]), torch.zeros([2292, 5])))
+
+    @requires_decomp(aten.nll_loss_forward)
+    def test_nll_loss_forward(self):
+        def fn(a, b):
+            return aten.nll_loss_forward(a, b, None, 1, -100)
+
+        self.common(
+            fn,
+            (
+                torch.randn([5, 5]),
+                torch.zeros([5], dtype=torch.int64),
+            ),
+        )
+
     def test_isinf(self):
         def fn(x):
             return x.isinf(), x.isnan()
@@ -1763,16 +1931,26 @@ class CommonTemplate:
         self.common(
             fn, [torch.tensor([1, float("inf"), 2, float("-inf"), float("nan")])]
         )
+        self.common(
+            fn,
+            [
+                torch.tensor(
+                    [1, float("inf"), 2, float("-inf"), float("nan")],
+                    dtype=torch.float64,
+                )
+            ],
+        )
 
     def test_any(self):
         def fn(x):
             return (
+                x.any(-1),
                 x.isinf().any(),
                 torch.all(x.isinf(), dim=0),
                 torch.all(torch.logical_not(x.isinf())),
             )
 
-        self.common(fn, [torch.randn(64)])
+        self.common(fn, [-torch.rand(64)])
         tmp = torch.randn(16, 8)
         tmp[1, 1] = float("inf")
         self.common(fn, [tmp])
@@ -1789,6 +1967,331 @@ class CommonTemplate:
             return (a, b, c, d, e, f, h)
 
         self.common(fn, [torch.randn(64) * 10])
+
+    def test_baddbmm(self):
+        def fn(a, b, c):
+            return aten.baddbmm(a, b, c)
+
+        self.common(
+            fn,
+            [
+                torch.randn(6, 1, 100),
+                torch.randn(6, 128, 64),
+                torch.randn(6, 64, 100),
+            ],
+        )
+
+    @patch.object(config.triton, "max_tiles", 2)
+    def test_fuse_tiled(self):
+        def fn(a, b, c):
+            return a + b, c + 1
+
+        self.common(
+            fn, [torch.randn(128, 1), torch.randn(1, 128), torch.randn(128, 128)]
+        )
+
+    def test_expand_as(self):
+        def fn(a, b):
+            return aten.expand_as(a, b), aten.expand_as(a + 1, b + 1) + 1
+
+        self.common(
+            fn,
+            [
+                torch.randn(6, 1, 100),
+                torch.randn(6, 128, 100),
+            ],
+        )
+
+    def test_index_put1(self):
+        def fn(a, b, c):
+            return (
+                torch.index_put(a, [b], c),
+                torch.index_put_(a + 1, [b + 1], c + 1) + 1,
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn([800, 256, 7, 7]),
+                torch.randperm(601),
+                torch.randn([601, 256, 7, 7]),
+            ],
+        )
+
+    def test_index_put2(self):
+        def fn(a, b, c):
+            return torch.index_put(a, [b], c, True)
+
+        self.common(
+            fn,
+            [
+                torch.randn([100, 256, 7, 7]),
+                torch.randint(0, 100, size=[600], dtype=torch.int64),
+                torch.randn([600, 256, 7, 7]),
+            ],
+            # workaround for https://github.com/openai/triton/issues/558
+            check_lowp=False,
+        )
+
+    @unittest.skipIf(not config.fallback_random, "requires config.fallback_random")
+    def test_bernoulli(self):
+        def fn(a):
+            b = torch.empty_like(a)
+            return aten.bernoulli_(b), b
+
+        self.common(
+            fn,
+            [
+                torch.randn([100]),
+            ],
+        )
+
+    def test_narrow(self):
+        def fn(x):
+            return aten.narrow(x, 1, 10, 16), aten.narrow(x + 2, 0, 10, 16) + 1
+
+        self.common(fn, [torch.randn(64, 64)])
+
+    def test_as_strided(self):
+        def fn(x):
+            return (
+                aten.as_strided(x, (8, 8, 64), (8 * 64, 64, 1), 0),
+                aten.as_strided(x + 1, (8, 8, 64), (8 * 64, 64, 1), 0) + 2,
+            )
+
+        self.common(fn, [torch.randn(64, 64)])
+
+    def test_select_scatter(self):
+        def fn(x, a, b):
+            return (
+                aten.select_scatter(x, a, 1, 0),
+                aten.select_scatter(x, b, 0, 1),
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn(8, 197, 38),
+                torch.randn(8, 38),
+                torch.randn(197, 38),
+            ],
+        )
+
+    def test_slice_scatter(self):
+        def fn(x, a):
+            return (
+                aten.slice_scatter(x, a, 2, 10, -10),
+                aten.slice_scatter(x, a[:, :, :40], 2, 10, -10, 2),
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn(4, 8, 100),
+                torch.randn(4, 8, 80),
+            ],
+        )
+
+    def test_slice_scatter2(self):
+        def fn(a, b):
+            return aten.slice_scatter(a, b, 0, 0, 9223372036854775807)
+
+        self.common(
+            fn,
+            [
+                torch.randn([8, 197, 384]),
+                torch.randn([8, 197, 384]),
+            ],
+        )
+
+    @unittest.skip("Triton kernel fails when xnumel == 1")
+    def test_scatter_add1(self):
+        def fn(a, dim, index, b):
+            return aten.scatter_add(a, dim, index, b)
+
+        self.common(
+            fn,
+            [
+                torch.randn(2, 3),
+                0,
+                torch.tensor([[0]]),
+                torch.randn(2, 3),
+            ],
+        )
+
+    def test_scatter_add2(self):
+        def fn(a, dim, index, b):
+            return aten.scatter_add(a, dim, index, b)
+
+        self.common(
+            fn,
+            [
+                torch.randn(2, 3),
+                0,
+                torch.tensor([[0, 0, 0], [1, 1, 1]]),
+                torch.randn(2, 3),
+            ],
+        )
+
+    def test_scatter_add3(self):
+        def fn(a, dim, index, b):
+            return aten.scatter_add(a, dim, index, b)
+
+        self.common(
+            fn,
+            [
+                torch.randn(5, 29, 13),
+                2,
+                torch.tensor([[[3, 5, 7, 9]]]),
+                torch.randn(1, 1, 10),
+            ],
+        )
+
+    def test_new_empty_strided(self):
+        def fn(a):
+            return aten.new_empty_strided(a, [1, 128, 128], [16384, 128, 1]).fill_(123)
+
+        self.common(fn, [torch.randn(55)])
+
+    @patch.object(torchinductor.config.triton, "cudagraphs", True)
+    def test_dropout(self):
+        random.seed(1234)
+        torch.manual_seed(1234)
+
+        @torchdynamo.optimize("inductor")
+        def fn(a):
+            return torch.nn.functional.dropout(a, 0.5, True)
+
+        x = torch.ones(1000, device=self.device, dtype=torch.float32)
+        result = fn(x)
+        self.assertTrue(400 < result.nonzero().shape[0] < 600)
+        self.assertTrue(0.9 < result.mean().item() < 1.1)
+
+    def test_dropout_deterministic(self):
+        if self.device == "cpu":
+            # TODO(jansel): CPU RNG is not yet deterministic
+            raise unittest.SkipTest("CPU currently nondeterministic")
+
+        @torchdynamo.optimize("inductor")
+        def fn(a):
+            return torch.nn.functional.dropout(a, 0.55, True)
+
+        for cg in (False, True):
+            with patch.object(torchinductor.config.triton, "cudagraphs", cg):
+                torchdynamo.reset()
+
+                x = torch.ones(1024, device=self.device, dtype=torch.float16)
+
+                torch.cuda.manual_seed(1234)
+                a0 = fn(x).clone()
+                a1 = fn(x).clone()
+                a2 = fn(x).clone()
+
+                torch.cuda.manual_seed(1234)
+                b0 = fn(x).clone()
+                b1 = fn(x).clone()
+                b2 = fn(x).clone()
+
+                # same seed, same values
+                self.assertTrue(torch.allclose(a0, b0))
+                self.assertTrue(torch.allclose(a1, b1))
+                self.assertTrue(torch.allclose(a2, b2))
+
+                # different calls, different values
+                self.assertFalse(torch.allclose(a0, a1))
+                self.assertFalse(torch.allclose(a1, a2))
+
+    def test_max_pool2d_with_indices_backward(self):
+        def fn(a, b, c):
+            return aten.max_pool2d_with_indices_backward(
+                a, b, [2, 2], [2, 2], [0, 0], [1, 1], False, c
+            )
+
+        x = torch.randn([2, 4, 18, 14])
+        result, indices = aten.max_pool2d_with_indices(
+            x,
+            [2, 2],
+            [2, 2],
+            [0, 0],
+            [1, 1],
+            False,
+        )
+
+        self.common(
+            fn,
+            [
+                torch.randn_like(result),
+                x,
+                indices,
+            ],
+        )
+
+    def test_max_pool2d_with_indices_backward2(self):
+        def fn(a, b, c):
+            return aten.max_pool2d_with_indices_backward(
+                a, b, [3, 3], [2, 2], [1, 1], [1, 1], True, c
+            )
+
+        x = torch.randn([2, 4, 40, 56])
+        result, indices = aten.max_pool2d_with_indices(
+            x,
+            [3, 3],
+            [2, 2],
+            [1, 1],
+            [1, 1],
+            True,
+        )
+
+        self.common(
+            fn,
+            [
+                torch.randn_like(result),
+                x,
+                indices,
+            ],
+        )
+
+    def test_avg_pool2d_backward(self):
+        def fn(a, b):
+            return aten.avg_pool2d_backward(
+                a,
+                b,
+                [2, 2],
+                [2, 2],
+                [0, 0],
+                True,
+                False,
+                None,
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn([2, 4, 7, 7]),
+                torch.randn([2, 4, 14, 14]),
+            ],
+        )
+
+    def test_avg_pool2d_backward2(self):
+        def fn(a, b):
+            return aten.avg_pool2d_backward(
+                a,
+                b,
+                [3, 3],
+                [1, 1],
+                [1, 1],
+                True,
+                False,
+                None,
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn([1, 1, 20, 15]),
+                torch.randn([1, 1, 20, 15]),
+            ],
+        )
 
 
 if HAS_CPU:

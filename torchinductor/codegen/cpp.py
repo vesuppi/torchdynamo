@@ -11,15 +11,16 @@ import torch
 
 from .. import codecache
 from .. import config
+from ..utils import sympy_product
 from ..virtualized import V
 from ..virtualized import ops
 from .common import BracesBuffer
+from .common import DeferredIndentedBuffer
 from .common import ExprPrinter
 from .common import IndentedBuffer
 from .common import Kernel
 from .common import KernelArgs
 from .common import OpOverrides
-from .common import product
 
 DTYPE_TO_CPP = {
     torch.float32: "float",
@@ -59,11 +60,13 @@ def cpp_prefix():
         textwrap.dedent(
             """
             #include <algorithm>
+            #include <atomic>
             #include <cmath>
             #include <cstdlib>
+            #include <iostream>
             #include <limits>
-            #define SLEEF_ENABLE_OMP_SIMD
-            //#include <sleef.h>
+            #include <random>
+            #include <omp.h>
 
             template<typename T>
             inline T mod(T a, T b) { return a % b; }
@@ -71,6 +74,12 @@ def cpp_prefix():
             inline float mod(float a, float b) { return std::fmod(a, b); }
             template<>
             inline double mod(double a, double b) { return std::fmod(a, b); }
+
+            float rand_cpu(unsigned int seed) {
+                static thread_local std::mt19937 gen(seed ^ omp_get_thread_num());
+                static_assert(std::mt19937::min() == 0);
+                return gen() * static_cast<float>(1.0 / (std::mt19937::max() + 1.0));
+            }
             """
         ),
         "h",
@@ -108,6 +117,14 @@ class CppOverrides(OpOverrides):
     @staticmethod
     def abs(x):
         return f"std::abs({x})"
+
+    @staticmethod
+    def sin(x):
+        return f"std::sin({x})"
+
+    @staticmethod
+    def cos(x):
+        return f"std::cos({x})"
 
     @staticmethod
     def exp(x):
@@ -196,6 +213,10 @@ class CppOverrides(OpOverrides):
     def and_(a, b):
         return f"{a} && {b}"
 
+    @staticmethod
+    def rand_cpu(seed: sympy.Expr, dtype):
+        return f"static_cast<{DTYPE_TO_CPP[dtype]}>(rand_cpu({seed}));"
+
 
 class CppKernel(Kernel):
     overrides = CppOverrides
@@ -210,7 +231,7 @@ class CppKernel(Kernel):
         self.itervars = None
         self.reduction_depth = None
         self.reduction_prefix = IndentedBuffer()
-        self.reduction_suffix = IndentedBuffer()
+        self.reduction_suffix = DeferredIndentedBuffer()
         self.reduction_vars = {}
 
     def load(self, name: str, index: sympy.Expr, upcast: bool = False):
@@ -219,11 +240,27 @@ class CppKernel(Kernel):
         index = self.rename_indexing(index)
         return self.cse.generate(self.loads, f"{var}[{cexpr(index)}]")
 
-    def store(self, name, index, value):
+    def store(self, name, index, value, mode=None):
         assert "buf" in name
         var = self.args.output(name)
         index = self.rename_indexing(index)
-        self.stores.writeline(f"{var}[{cexpr(index)}] = {value};")
+        if mode is None:
+            line = f"{var}[{cexpr(index)}] = {value};"
+        elif mode == "atomic_add":
+            if config.cpp.threads == 1:
+                line = f"{var}[{cexpr(index)}] += {value};"
+            else:
+                # Note atomic_ref requires C++20 and certain processor features
+                self.stores.writeline(
+                    name,
+                    "static_assert(std::atomic_ref<"
+                    + f"std::remove_pointer_t<decltype({var})>"
+                    + ">::is_always_lock_free);",
+                )
+                line = f"std::atomic_ref({var}[{cexpr(index)}]) += {value};"
+        else:
+            raise NotImplementedError(f"store mode={mode}")
+        self.stores.writeline(name, line)
 
     def reduction(self, name, dtype, reduction_type, index, value):
         tmpvar = self.cse.generate(
@@ -234,11 +271,13 @@ class CppKernel(Kernel):
         self.reduction_prefix.writeline(
             f"{DTYPE_TO_CPP[dtype]} {tmpvar} = {reduction_init(reduction_type, dtype)};"
         )
-        self.stores.writeline(f"{reduction_combine(reduction_type, tmpvar, value)};")
+        self.stores.writeline(
+            None, f"{reduction_combine(reduction_type, tmpvar, value)};"
+        )
         if name not in V.graph.removed_buffers:
             var = self.args.output(name)
-            self.reduction_suffix.writeline(f"{var}[{cexpr(index)}] = {tmpvar};")
-        self.cse.store_cache[(name, index)] = tmpvar
+            self.reduction_suffix.writeline(name, f"{var}[{cexpr(index)}] = {tmpvar};")
+        self.cse.store_cache[name] = tmpvar
 
     def set_ranges(self, lengths, reduction_lengths):
         if self.call_ranges:
@@ -257,12 +296,12 @@ class CppKernel(Kernel):
         )
 
     def size_hint(self):
-        return V.graph.sizevars.size_hint(product(self.call_ranges))
+        return V.graph.sizevars.size_hint(sympy_product(self.call_ranges))
 
     def codegen_loops(self, code, worksharing):
         threads = config.cpp.threads
         if threads < 1:
-            threads = multiprocessing.cpu_count()
+            threads = multiprocessing.cpu_count() // 2
 
         loops = [LoopLevel(var, size) for var, size in zip(self.itervars, self.ranges)]
         loops, reductions = LoopNest(loops[: self.reduction_depth]), LoopNest(
@@ -351,7 +390,7 @@ class CppKernel(Kernel):
         prior = (self.loads, self.compute, self.stores, self.cse)
         self.loads = IndentedBuffer()
         self.compute = IndentedBuffer()
-        self.stores = IndentedBuffer()
+        self.stores = DeferredIndentedBuffer()
         self.cse = self.cse.clone()
         yield
         self.reduction_suffix.splice(self.loads)
@@ -371,17 +410,6 @@ class CppScheduling:
     def codegen(self, *groups):
         group, reduction_group = groups
 
-        def check_group1(other_node):
-            other_groups = other_node.group
-            return (
-                check_group2(other_node)
-                or other_groups == groups
-                or other_groups == (group + reduction_group, ())
-            )
-
-        def check_group2(other_node):
-            return other_node.group == (group, ())
-
         kernel_group = self.kernel_group
         scheduler = self.scheduler
         with scheduler.kernel(kernel_group.new_kernel()) as kernel:
@@ -389,7 +417,6 @@ class CppScheduling:
 
             # first any pointwise sharing same loops
             for node in scheduler.pop_group((group + reduction_group, ())):
-                scheduler.maybe_remove_buffer(node, check_group1)
                 node.run(vars, reduction_vars)
                 node.mark_fusable()
 
@@ -406,7 +433,6 @@ class CppScheduling:
                 # we can fuse in some extra pointwise into the suffix
                 with kernel.write_to_suffix():
                     for node in scheduler.pop_group((group, ())):
-                        scheduler.maybe_remove_buffer(node, check_group2)
                         node.run(vars, ())
                         node.mark_fusable()
 

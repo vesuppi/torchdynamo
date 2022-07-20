@@ -79,6 +79,7 @@ def _disallowed_function_ids():
         torch.autograd.grad,
         torch.clear_autocast_cache,
         torch.cuda.current_device,
+        torch.cuda.amp.autocast_mode.autocast,
         torch.distributions.constraints.is_dependent,
         torch.distributions.normal.Normal,
         torch.inference_mode,
@@ -91,6 +92,17 @@ def _disallowed_function_ids():
         torch.autograd.profiler.profile,
         warnings.warn,
     ]
+    # extract all dtypes from torch
+    dtypes = [
+        obj for obj in torch.__dict__.values() if isinstance(obj, type(torch.float32))
+    ]
+    remove += dtypes
+    storage = [
+        obj
+        for obj in torch.__dict__.values()
+        if isinstance(obj, type(torch.FloatStorage))
+    ]
+    remove += storage
     return {id(x) for x in remove}
 
 

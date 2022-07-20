@@ -17,6 +17,7 @@ from .ir import FixedLayout
 from .ir import InputBuffer
 from .ir import TensorBox
 from .lowering import lowerings
+from .lowering import needs_realized_inputs
 from .sizevars import SizeVarAllocator
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,32 @@ class GraphLowering(torch.fx.Interpreter):
         self.num_dynamic_inputs = num_dynamic_inputs
         self.num_static_inputs = None
         self.mutated_inputs = set()
+        self.randomness_offset = sympy.Integer(0)
+        self.randomness_seeds = []
+        self.name_to_buffer = {}
+
+    def random_seed_buffer(self, device: torch.device):
+        """
+        Return a device-unique 1-element tensor storing our RNG seed.
+        This will get initialized at the start of each graph in
+        `wrapper.py`.
+
+        Note this is only used by cuda backends.  The CPU backend handles
+        RNG seeds as a sizevar.
+        """
+        name = f"seed_{device.type}_{device.index}"
+        if name not in self.constants:
+            self.constants[name] = torch.zeros((), device=device, dtype=torch.int32)
+            self.randomness_seeds.append(name)
+        return name
+
+    def increment_randomness_offset(self, numel):
+        """
+        A global counter of how many random numbers we have handed out so far.
+        """
+        offset = self.randomness_offset
+        self.randomness_offset = offset + numel
+        return offset
 
     def run(self, *args):
         if self.num_dynamic_inputs is None:
@@ -85,6 +112,7 @@ class GraphLowering(torch.fx.Interpreter):
     def register_buffer(self, buffer: ir.ComputedBuffer):
         name = f"buf{len(self.buffers)}"
         self.buffers.append(buffer)
+        self.name_to_buffer[name] = buffer
         return name
 
     def realize_users_of(self, name: str):
@@ -191,7 +219,9 @@ class GraphLowering(torch.fx.Interpreter):
     def output(self, target, args, kwargs):
         result = super().output(target, args, kwargs)
         assert isinstance(result, (tuple, list)), type(result)
-        assert all(isinstance(x, TensorBox) for x in result), result
+        assert all(
+            isinstance(x, (TensorBox, ir.Constant, type(None))) for x in result
+        ), result
         self.graph_outputs = [ir.ExternKernel.realize_input(x) for x in result]
 
         for name, value in self.graph_inputs.items():
@@ -203,6 +233,7 @@ class GraphLowering(torch.fx.Interpreter):
             if not isinstance(value, InputBuffer) or value.get_name() != name:
                 # one of our inputs was mutated, need to turn that into a copy
                 ir.MutationLayout.realize_into(value, self.graph_inputs_original[name])
+
         self.finalize()
 
     def finalize(self):
@@ -213,6 +244,10 @@ class GraphLowering(torch.fx.Interpreter):
         result = super().run_node(n)
         num_users = len(set(n.users))
         if num_users > 1 and isinstance(result, TensorBox):
+            for user in n.users:
+                if user.target in needs_realized_inputs:
+                    result.realize()
+
             # TODO(jansel): introduce a store vs inline choice
             result.mark_reuse(len(n.users))
         return result
