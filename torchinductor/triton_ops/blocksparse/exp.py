@@ -107,7 +107,7 @@ def _exp_kernel(x_rowptrs, x_cols, x_data, y_data,
     tl.store(y_offsets, block)
 
 
-def exp(x_mask: RaggedFormat, x_data):
+def kernel(x_mask: RaggedFormat, x_data):
     '''
     Launch a 2D grid to do the computation.
 
@@ -124,6 +124,6 @@ def exp(x_mask: RaggedFormat, x_data):
     )
     # Same mask is used for y
     y_mask = x_mask.copy()
-    y_mask.default = 1
+    y_mask.default = torch.exp(x_mask.default)
     return (y_mask, y_data)
 
