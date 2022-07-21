@@ -156,8 +156,10 @@ def to_triton_blocksparse_format(a, BLOCK_M: int, BLOCK_N: int):
 
 def from_block_format(a):
     # TODO - Implement/check for padding
+    if a.dim() == 4:
+        a = a[None, :]
     B, outer_m_dim, outer_n_dim, BLOCK_M, BLOCK_N = a.shape
-
+    
     M = outer_m_dim * BLOCK_M
     N = outer_n_dim * BLOCK_N
 
