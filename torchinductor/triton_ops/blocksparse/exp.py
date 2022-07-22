@@ -76,6 +76,7 @@ def _exp_kernel(x_rowptrs, x_cols, x_data, y_data,
                 ):
     m = tl.program_id(0)
     n = tl.program_id(1)
+    bid = tl.program_id(2)
     
     ## Format specific: how to get `k` would depend on the format
     col_start = tl.load(x_cols + 2*m)
@@ -95,8 +96,8 @@ def _exp_kernel(x_rowptrs, x_cols, x_data, y_data,
         pass
     offsets += tl.arange(0, BM)[:, None] * BN + tl.arange(0, BN)[None, :] 
     offsets += n * block_size
-    x_offsets = x_data + offsets
-    y_offsets = y_data + offsets
+    x_offsets = x_data + offsets + bid * M * N
+    y_offsets = y_data + offsets + bid * M * N
 
     ## Format specific: how to get `k` would depend on the format
     block = tl.load(x_offsets)
