@@ -14,6 +14,7 @@ def _sum_kernel(x_rowptrs, x_cols, x_data, y_data,
                 ):
     inner_id = tl.program_id(0)
     outer_id = tl.program_id(1)
+    bid = tl.program_id(2)
     
     block_size = BM * BN
 
@@ -30,7 +31,7 @@ def _sum_kernel(x_rowptrs, x_cols, x_data, y_data,
         pass
 
     offsets += inner_id * TM * BN + tl.arange(0, TM)[:, None] * BN + tl.arange(0, BN)[None, :]
-    x_offsets = x_data + offsets
+    x_offsets = x_data + offsets + bid * M * N
 
     sum = tl.zeros([TM], dtype=tl.float32)
     for _ in range(col_start, col_end):
@@ -38,7 +39,7 @@ def _sum_kernel(x_rowptrs, x_cols, x_data, y_data,
         sum += tl.sum(block, axis=1)
         x_offsets += block_size    
 
-    y_offsets = y_data + outer_id * BM + inner_id * TM + tl.arange(0, TM)
+    y_offsets = y_data + outer_id * BM + inner_id * TM + tl.arange(0, TM) + bid * M
     tl.store(y_offsets, sum)
     
 

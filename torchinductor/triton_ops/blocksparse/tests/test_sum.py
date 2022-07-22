@@ -41,17 +41,21 @@ def bench_kernel(a, config=''):
     print(config, f'{B}x{M}x{N}', f'{ms0:.4f}', f'{ms1:.4f}', sep='; ')
 
 
-def test_configs(configs):
+def test_shape(shape, configs):
     dtype = torch.float32 
-    for B in [1]:
-        for M in [1024, 2048, 4096]:
-            for N in [1024, 2048, 4096]:
-                a = torch.ones([B, M, N], dtype=dtype, device='cuda')
-                if 'dense' in configs:
-                    bench_kernel(a, 'dense')
-                if 'tril' in configs:
-                    a = torch.tril(a)
-                    bench_kernel(a, 'tril')
+    B, M, N = shape
+    a = torch.rand([B, M, N], dtype=dtype, device='cuda')
+    if 'dense' in configs:
+        bench_kernel(a, 'dense')
+    if 'tril' in configs:
+        a = torch.tril(a)
+        bench_kernel(a, 'tril')
+
+
+def test_seqlen_128_to_4K(configs, batch_size=96):
+    for seqlen in [128, 256, 512, 1024, 2048]:
+    #for seqlen in [4096]:
+        test_shape((batch_size, seqlen, seqlen), configs)
 
 
 if '-v' in sys.argv:
@@ -60,12 +64,6 @@ if '-v' in sys.argv:
 
 configs = []
 if '--tril' in sys.argv:
-    configs.append('tril')
+    test_seqlen_128_to_4K(['tril'])
 if '--dense' in sys.argv:
-    configs.append('dense')
-
-test_configs(configs)
-
-'''
-Performance seems to vary significant for different block sizes.
-'''
+    test_seqlen_128_to_4K(['dense'])
