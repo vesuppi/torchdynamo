@@ -1,5 +1,4 @@
 import sys
-from sentry_sdk import configure_scope
 import torch
 import triton 
 from torchinductor.triton_ops.blocksparse.utils import *

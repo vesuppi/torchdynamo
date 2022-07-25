@@ -2,7 +2,7 @@ import sys
 import torch
 import triton 
 from torchinductor.triton_ops.blocksparse.utils import *
-from torchinductor.triton_ops.blocksparse.exp import kernel
+from torchinductor.triton_ops.blocksparse.exp import exp as kernel
 
 VERBOSE = False
 

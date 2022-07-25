@@ -109,7 +109,7 @@ def _exp_kernel(x_rowptrs, x_cols, x_data, y_data,
     tl.store(y_offsets, block)
 
 
-def kernel(x_mask: RaggedFormat, x_data):
+def exp(x_mask: RaggedFormat, x_data):
     '''
     Launch a 2D grid to do the computation.
 
