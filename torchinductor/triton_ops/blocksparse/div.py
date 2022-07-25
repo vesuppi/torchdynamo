@@ -66,3 +66,13 @@ def div_colvec(x_mask: RaggedFormat, x_data, y):
     # Same mask is used for y
     return (x_mask, z_data)
 
+
+def div(x_mask: RaggedFormat, x_data, y):
+    B, m, n, BM, BN = x_data.shape
+    M = m * BM
+    N = n * BN
+    
+    if y.shape == (B, M):
+        return div_colvec(x_mask, x_data, y)
+    else:
+        assert False, "Unsupported"
