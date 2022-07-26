@@ -10,11 +10,12 @@ def bench_triton(a):
     times = []
     for (BM, BN) in [(16, 16), (32, 32), (64, 64)]:
         a_data, a_mask = to_block_format_with_mask_bmm_one_mask(a, BM, BN)
+        #print(a_data[0,0])
         a_mask = RaggedFormat.from_dense_mask(a_mask)
         b_data = kernel(a_mask, a_data)
         b_ref = torch.sum(a, axis=-1)
         #print(b_ref.shape, b_data.shape)
-        assert torch.allclose(b_ref, b_data), (b_ref, b_data)
+        assert torch.allclose(b_ref, b_data), (torch.squeeze(b_ref), torch.squeeze(b_data))
         
         try:
             ms0, _, _ = triton.testing.do_bench(lambda: kernel(a_mask, a_data), rep=50)
@@ -41,7 +42,7 @@ def bench_kernel(a, config=''):
 def test_shape(shape, configs):
     dtype = torch.float32 
     B, M, N = shape
-    a = torch.rand([B, M, N], dtype=dtype, device='cuda')
+    a = torch.ones([B, M, N], dtype=dtype, device='cuda')
     if 'dense' in configs:
         bench_kernel(a, 'dense')
     if 'tril' in configs:
@@ -60,7 +61,8 @@ if '-v' in sys.argv:
 
 
 configs = []
-if '--tril' in sys.argv:
-    test_seqlen_128_to_4K(['tril'])
 if '--dense' in sys.argv:
     test_seqlen_128_to_4K(['dense'])
+if '--tril' in sys.argv:
+    test_seqlen_128_to_4K(['tril'])
+
