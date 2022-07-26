@@ -13,6 +13,34 @@ def softmax_unfused(x_mask, x_data):
     return (mask, t2)
 
 
+def num_warps(n):
+    if n <= 128:
+        return 1
+    if n <= 256:
+        return 2
+    if n <= 512:
+        return 4
+    if n <= 4096:
+        return 8
+    return 16
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=4, num_warps=2),
+        
+        triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=4),
+
+        triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+    ],
+    key=['M', 'N']
+)
 @triton.jit
 def _softmax_kernel(x_rowptrs, x_cols, x_data, y_data, 
                 M: tl.constexpr, N: tl.constexpr,
@@ -73,11 +101,12 @@ def softmax(x_mask: RaggedFormat, x_data, axis=1):
     M = m * BM
     N = n * BN
     y_data = torch.empty_like(x_data)
-    TM = 4  # Tunable parameter
+    TM = 16  # Tunable parameter
     grid = (BM//TM, m, B)
     _softmax_kernel[grid](
         x_mask.rowptrs, x_mask.cols, x_data, y_data,
-        M, N, BM, BN, TM, BN, True
+        M, N, BM, BN, TM, BN, True,
+        #num_warps=num_warps(N)
     )
     
     y_mask = x_mask.copy()

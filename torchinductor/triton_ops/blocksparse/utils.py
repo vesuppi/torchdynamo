@@ -122,7 +122,7 @@ def to_block_format_with_mask_bmm_one_mask(a, BLOCK_M: int, BLOCK_N: int):
         device=a.device,
     )
 
-    mask = torch.ones([outer_m_dim, outer_n_dim], device=a.device)
+    mask = torch.ones([outer_m_dim, outer_n_dim], device=a.device, dtype=torch.bool)
 
     # TODO - Implement/check for padding
     for m in range(outer_m_dim):
@@ -137,6 +137,42 @@ def to_block_format_with_mask_bmm_one_mask(a, BLOCK_M: int, BLOCK_N: int):
                 mask[m, n] = 0
             elif torch.all(block == -torch.inf):
                 mask[m, n] = 0
+    return (res, mask)
+
+
+def to_sparseblock_format(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
+    assert a.dim() == 3
+    # batch_size, num_heads, rows, cols
+    Z, H, M, N = (1,1,1,1)
+    if a.dim() == 3:
+        Z, M, N = a.shape
+    
+    outer_m_dim = cdiv(M, BLOCK_M)
+    outer_n_dim = cdiv(N, BLOCK_N)
+    inner_m_dim = BLOCK_M
+    inner_n_dim = BLOCK_N
+
+    res = torch.empty(
+        (Z, outer_m_dim, outer_n_dim, inner_m_dim, inner_n_dim),
+        dtype=a.dtype,
+        device=a.device,
+    )
+
+    mask = torch.ones([outer_m_dim, outer_n_dim], device=a.device, dtype=torch.bool)
+    for m in range(outer_m_dim):
+        for n in range(outer_n_dim):
+            block = a[
+                :,
+                m * BLOCK_M: (m+1) * BLOCK_M, 
+                n * BLOCK_N: (n+1) * BLOCK_N
+            ]
+            res[:, m, n, 0: BLOCK_M, 0: BLOCK_N] = block
+            if torch.all(block == compressed_val):
+                mask[m, n] = 0
+
+    mask = mask.expand(H, -1, -1)
+    res = triton.testing.sparsify_tensor(a[:, None, :, :], mask, BLOCK_M)
+    
     return (res, mask)
 
 
