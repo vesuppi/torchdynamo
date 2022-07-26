@@ -66,7 +66,8 @@ def bench_kernel(a, config=''):
     if VERBOSE:
         print(f'torch: {ms0:.4f}')
     ms1 = bench_triton(a)
-    print(config, f'{B}x{M}x{N}', f'{ms0:.4f}', f'{ms1:.4f}', sep='; ')
+    ms2 = bench_ours(a)
+    print(config, f'{B}x{M}x{N}', f'{ms0:.4f}', f'{ms1:.4f}', f'{ms2:.4f}', sep='; ')
 
 
 def test_shape(shape, configs):

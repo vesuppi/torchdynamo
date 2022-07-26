@@ -8,26 +8,24 @@ VERBOSE = False
 
 def bench_triton(a): 
     times = []
-    for BM in [16, 32, 64]:
-        for BN in [16, 32, 64]:
-            a_data, a_mask = to_block_format_with_mask_bmm_one_mask(a, BM, BN)
-            a_mask = RaggedFormat.from_dense_mask(a_mask)
-            b_data = kernel(a_mask, a_data)
-            b_ref = torch.sum(a, axis=-1)
-            #print(b_ref.shape, b_data.shape)
-            assert torch.allclose(b_ref, b_data), (b_ref, b_data)
-            
-            for num_warps in [2,4,8]:
-                for num_stages in [3,4]:
-                    try:
-                        ms0, _, _ = triton.testing.do_bench(lambda: kernel(a_mask, a_data), rep=50)
-                    except Exception as e:
-                        print(e)
-                    else:
-                        times.append((ms0, BM, BN, num_warps, num_stages))
-                        if VERBOSE:
-                            print((ms0, BM, BN, num_warps, num_stages))
+    for (BM, BN) in [(16, 16), (32, 32), (64, 64)]:
+        a_data, a_mask = to_block_format_with_mask_bmm_one_mask(a, BM, BN)
+        a_mask = RaggedFormat.from_dense_mask(a_mask)
+        b_data = kernel(a_mask, a_data)
+        b_ref = torch.sum(a, axis=-1)
+        #print(b_ref.shape, b_data.shape)
+        assert torch.allclose(b_ref, b_data), (b_ref, b_data)
+        
+        try:
+            ms0, _, _ = triton.testing.do_bench(lambda: kernel(a_mask, a_data), rep=50)
+        except Exception as e:
+            print(e)
+        else:
+            times.append((ms0, BM, BN))
+            if VERBOSE:
+                print((ms0, BM, BN))
     times.sort(key=lambda x: x[0])
+    #print(times)
     return times[0][0]
 
 

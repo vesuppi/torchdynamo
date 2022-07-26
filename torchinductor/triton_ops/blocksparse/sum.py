@@ -5,6 +5,24 @@ import triton.language as tl
 from torchinductor.triton_ops.blocksparse.utils import *
 
 
+@triton.autotune(
+    configs=[
+        #triton.Config({}, num_stages=2, num_warps=2),
+        triton.Config({}, num_stages=3, num_warps=2),
+        triton.Config({}, num_stages=4, num_warps=2),
+        
+        #triton.Config({}, num_stages=2, num_warps=4),
+        triton.Config({}, num_stages=3, num_warps=4),
+        triton.Config({}, num_stages=4, num_warps=4),
+
+        #triton.Config({}, num_stages=2, num_warps=8),
+        triton.Config({}, num_stages=3, num_warps=8),
+        triton.Config({}, num_stages=4, num_warps=8),
+
+        triton.Config({}, num_stages=3, num_warps=16),
+    ],
+    key=['M', 'N']
+)
 @triton.jit
 def _sum_kernel(x_rowptrs, x_cols, x_data, y_data, 
                 M: tl.constexpr, N: tl.constexpr,
@@ -54,7 +72,7 @@ def sum(x_mask: RaggedFormat, x_data, axis=1):
     M = m * BM
     N = n * BN
     y_data = torch.empty([B, M], dtype=x_data.dtype, device='cuda')
-    TM = 8  # Tunable parameter
+    TM = 1  # Tunable parameter
     grid = (BM//TM, m, B)
     _sum_kernel[grid](
         x_mask.rowptrs, x_mask.cols, x_data, y_data,
