@@ -6,6 +6,13 @@ from torchinductor.triton_ops.blocksparse.softmax import softmax as kernel
 
 VERBOSE = False
 
+def mysoftmax(a, axis=-1):
+    return torch.softmax(a, axis=axis)
+    e = torch.exp(a)
+    s = torch.sum(e, axis=axis)
+    return e / s[:, :, None]
+
+
 def bench_triton(a): 
     times = []
     for BM in [16, 32, 64]:
@@ -15,10 +22,10 @@ def bench_triton(a):
             a_mask.default = -torch.inf
             b_mask, b_data = kernel(a_mask, a_data)
             b_dense = b_mask.to_dense(b_data)
-            b_ref = torch.softmax(a, axis=-1)
+            b_ref = mysoftmax(a, axis=-1)
             assert torch.allclose(b_ref, b_dense), (b_ref, b_dense)
             for num_warps in [2,4,8]:
-                for num_stages in  [2,3,4]:
+                for num_stages in [2,3,4]:
                     try:
                         ms0, _, _ = triton.testing.do_bench(lambda: kernel(a_mask, a_data), rep=50)
                     except Exception as e:
@@ -33,7 +40,7 @@ def bench_triton(a):
 
 def bench_kernel(a, config=''):
     B, M, N = a.shape
-    ms0, _, _ = triton.testing.do_bench(lambda: torch.softmax(a, axis=-1))
+    ms0, _, _ = triton.testing.do_bench(lambda: mysoftmax(a, axis=-1))
     if VERBOSE:
         print(f'torch: {ms0:.4f}')
     ms1 = bench_triton(a)
@@ -63,7 +70,7 @@ if '-v' in sys.argv:
 
 
 configs = []
-if '--tril' in sys.argv:
-    test_seqlen_128_to_4K(['tril'])
 if '--dense' in sys.argv:
     test_seqlen_128_to_4K(['dense'])
+if '--tril' in sys.argv:
+    test_seqlen_128_to_4K(['tril'])

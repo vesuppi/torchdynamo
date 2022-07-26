@@ -18,7 +18,7 @@ def bench_triton_exp(a):
             assert torch.allclose(torch.exp(a), b_dense), \
                 (torch.exp(a)[0,0], b_dense[0,0])
             for num_warps in [2,4,8]:
-                for num_stages in  [2,3,4]:
+                for num_stages in [2,3,4]:
                     try:
                         ms0, _, _ = triton.testing.do_bench(lambda: kernel(a_mask, a_data), rep=50)
                     except Exception as e:
