@@ -24,6 +24,10 @@ def bench_triton(a):
         func = triton_softmax(a_mask, BM, 'cuda')
         b_mask = RaggedFormat.from_dense_mask(a_mask.squeeze(), default=0)
         b_data = func(a_data)
+
+        b_data_ref, _ = to_sparseblock_format(b_ref, BM, BN, compressed_val=0)
+        #print(b_data.shape, b_data_ref.shape)
+        assert torch.allclose(b_data, b_data_ref)
         #print(b_data)
         #print(b_ref)
 
