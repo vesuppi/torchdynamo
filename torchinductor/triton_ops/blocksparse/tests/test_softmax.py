@@ -19,13 +19,13 @@ def bench_triton(a):
     for (BM, BN) in [(16, 16), (32, 32), (64, 64)]:
     #for (BM, BN) in [(32, 32)]:
         b_ref = mysoftmax(a, axis=-1)
-        a_data, a_mask = to_sparseblock_format(a, BM, BN, compressed_val=-torch.inf)
+        a_data, a_mask = to_sparseblock_with_dense_mask(a, BM, BN, compressed_val=-torch.inf)
         
         func = triton_softmax(a_mask, BM, 'cuda')
         b_mask = RaggedFormat.from_dense_mask(a_mask.squeeze(), default=0)
         b_data = func(a_data)
 
-        b_data_ref, _ = to_sparseblock_format(b_ref, BM, BN, compressed_val=0)
+        b_data_ref, _ = to_sparseblock_with_dense_mask(b_ref, BM, BN, compressed_val=0)
         #print(b_data.shape, b_data_ref.shape)
         assert torch.allclose(b_data, b_data_ref)
         #print(b_data)

@@ -144,16 +144,16 @@ def _softmax_kernel_noloop(x_rowptrs, x_cols, x_data, y_data,
     offsets += col_start * block_size
     offsets += block_n * block_size
     offsets += inner_id * BN + lane_n
-    x_offsets = x_data + offsets 
+    x_ptrs = x_data + offsets 
 
     mask = block_n < col_end
-    x = tl.load(x_offsets, mask=mask, other=-float("inf"))
+    x = tl.load(x_ptrs, mask=mask, other=-float("inf"))
     x = x - tl.max(x, 0)
     e = tl.exp(x)
     s = tl.sum(e, axis=0)
     d = tl.fdiv(e, s)
-    y_offsets = y_data + offsets
-    tl.store(y_offsets, d, mask=mask)
+    y_ptrs = y_data + offsets
+    tl.store(y_ptrs, d, mask=mask)
     
 
 def softmax(x_mask: RaggedFormat, x_data, axis=1):

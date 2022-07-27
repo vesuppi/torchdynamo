@@ -9,6 +9,44 @@ class BCSR():
         self.vals = vals
 
 
+class FastBCSR:
+    def __init__(self, rowptrs, cols, fastcols, vals, default=0):
+        self.rowptrs = rowptrs
+        self.cols = cols
+        self.fastcols = fastcols
+        self.vals = vals
+        self.default = default
+
+    def to_dense(self, a):
+        '''
+        Return a dense representation of `a`.
+        '''
+        B, m, n, BLOCK_M, BLOCK_N = a.shape
+
+        M = m * BLOCK_M
+        N = n * BLOCK_N
+
+        res = torch.zeros((B, M, N), dtype=a.dtype, device=a.device)
+
+        for i in range(m):
+            col_start = self.fastcols[2*i]
+            col_end = self.fastcols[2*i+1]
+            for j in range(n):
+                if j < col_start or j >= col_end:
+                    block = torch.empty([B, BLOCK_M, BLOCK_N], dtype=a.dtype, device=a.device)
+                    block.fill_(self.default)
+                else:
+                    block = a[:, i, j, 0: BLOCK_M, 0: BLOCK_N]
+
+                res[
+                    :,
+                    i * BLOCK_M: (i+1) * BLOCK_M, 
+                    j * BLOCK_N: (j+1) * BLOCK_N
+                ] = block
+
+        return res
+        
+
 class RaggedFormat:
     def __init__(self, rowptrs, cols, default=0):
         self.rowptrs = rowptrs
@@ -140,7 +178,7 @@ def to_block_format_with_mask_bmm_one_mask(a, BLOCK_M: int, BLOCK_N: int):
     return (res, mask)
 
 
-def to_sparseblock_format(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
+def to_sparseblock_with_dense_mask(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
     assert a.dim() == 3
     # batch_size, num_heads, rows, cols
     Z, H, M, N = (1,1,1,1)
@@ -174,6 +212,13 @@ def to_sparseblock_format(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
     res = triton.testing.sparsify_tensor(a[:, None, :, :], mask, BLOCK_M)
     
     return (res, mask)
+
+
+def to_fast_bcsr_format(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
+    vals, mask = to_sparseblock_with_dense_mask(a, BLOCK_M, BLOCK_N, compressed_val)
+    rowptrs, cols, fastcols = to_fast_bcsr_mask(mask)
+    f = FastBCSR(rowptrs, cols,  fastcols, vals, compressed_val)
+    return f    
 
 
 def to_triton_blocksparse_format(a, BLOCK_M: int, BLOCK_N: int):
@@ -238,6 +283,37 @@ def to_csr_ptrs(a, device='cuda'):
         rowptrs[i+1] = nnz
     assert nnz == torch.sum(a)
     return (rowptrs, cols)
+
+
+def to_fast_bcsr_mask(a, device='cuda'):
+    rowptrs, cols = to_csr_ptrs(a)
+    m, n = a.shape
+
+    col_segs = torch.empty(2*m, dtype=torch.int, device=device)
+    for i in range(m):
+        start = -1
+        end = -1
+        for j in range(n):
+            if j == 0:
+                if a[i,j] != 0:
+                    start = j
+
+            if j == n-1:
+                if a[i,j] != 0:
+                    end = j + 1
+                    continue
+
+            if a[i,j] != 0:
+                if a[i,j-1] == 0:
+                    start = j
+            elif a[i,j] == 0:
+                if a[i,j-1] != 0:
+                    end = j
+            
+        col_segs[2*i] = start
+        col_segs[2*i+1] = end
+
+    return (rowptrs, cols, col_segs)
 
 
 def to_ragged_format_simple(a, device='cuda'):
