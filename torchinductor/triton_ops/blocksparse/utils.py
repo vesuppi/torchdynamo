@@ -10,41 +10,60 @@ class BCSR():
 
 
 class FastBCSR:
-    def __init__(self, rowptrs, cols, fastcols, vals, default=0):
+    def __init__(self, Z, M, N, BM, BN, rowptrs, cols, fastcols, vals, is_blocks_dense, default=0):
         self.rowptrs = rowptrs
         self.cols = cols
         self.fastcols = fastcols
         self.vals = vals
         self.default = default
+        self.M = M
+        self.N = N
+        self.Z = Z
+        self.BM = BM
+        self.BN = BN
+        self.is_blocks_dense = is_blocks_dense
+    
+    def to_format(a, BLOCK_M: int, BLOCK_N: int, is_blocks_dense=False, compressed_val=0):
+        Z, M, N = a.shape
+        if is_blocks_dense:
+            vals, mask = to_block_format_with_mask_bmm_one_mask(a, BLOCK_M, BLOCK_N)
+        else:
+            vals, mask = to_sparseblock_with_dense_mask(a, BLOCK_M, BLOCK_N, compressed_val)
+            mask = torch.squeeze(mask)
+        rowptrs, cols, fastcols = to_fast_bcsr_mask(mask)
+        f = FastBCSR(Z, M, N, BLOCK_M, BLOCK_N, rowptrs, cols,  fastcols, vals, 
+                    is_blocks_dense, compressed_val)
+        return f
 
-    def to_dense(self, a):
-        '''
-        Return a dense representation of `a`.
-        '''
-        B, m, n, BLOCK_M, BLOCK_N = a.shape
+    # def to_dense(self):
+    #     '''
+    #     Return a dense representation of vals.
+    #     '''
+    #     a = self.vals
+    #     B, m, n, BLOCK_M, BLOCK_N = a.shape
 
-        M = m * BLOCK_M
-        N = n * BLOCK_N
+    #     M = m * BLOCK_M
+    #     N = n * BLOCK_N
 
-        res = torch.zeros((B, M, N), dtype=a.dtype, device=a.device)
+    #     res = torch.zeros((B, M, N), dtype=a.dtype, device=a.device)
 
-        for i in range(m):
-            col_start = self.fastcols[2*i]
-            col_end = self.fastcols[2*i+1]
-            for j in range(n):
-                if j < col_start or j >= col_end:
-                    block = torch.empty([B, BLOCK_M, BLOCK_N], dtype=a.dtype, device=a.device)
-                    block.fill_(self.default)
-                else:
-                    block = a[:, i, j, 0: BLOCK_M, 0: BLOCK_N]
+    #     for i in range(m):
+    #         col_start = self.fastcols[2*i]
+    #         col_end = self.fastcols[2*i+1]
+    #         for j in range(n):
+    #             if j < col_start or j >= col_end:
+    #                 block = torch.empty([B, BLOCK_M, BLOCK_N], dtype=a.dtype, device=a.device)
+    #                 block.fill_(self.default)
+    #             else:
+    #                 block = a[:, i, j, 0: BLOCK_M, 0: BLOCK_N]
 
-                res[
-                    :,
-                    i * BLOCK_M: (i+1) * BLOCK_M, 
-                    j * BLOCK_N: (j+1) * BLOCK_N
-                ] = block
+    #             res[
+    #                 :,
+    #                 i * BLOCK_M: (i+1) * BLOCK_M, 
+    #                 j * BLOCK_N: (j+1) * BLOCK_N
+    #             ] = block
 
-        return res
+    #     return res
         
 
 class RaggedFormat:
@@ -179,6 +198,9 @@ def to_block_format_with_mask_bmm_one_mask(a, BLOCK_M: int, BLOCK_N: int):
 
 
 def to_sparseblock_with_dense_mask(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
+    '''
+    The resulting vals is a 4d tensor of shape (Z, sum_of_mask, BM, BN).
+    '''
     assert a.dim() == 3
     # batch_size, num_heads, rows, cols
     Z, H, M, N = (1,1,1,1)
@@ -212,13 +234,6 @@ def to_sparseblock_with_dense_mask(a, BLOCK_M: int, BLOCK_N: int, compressed_val
     res = triton.testing.sparsify_tensor(a[:, None, :, :], mask, BLOCK_M)
     
     return (res, mask)
-
-
-def to_fast_bcsr_format(a, BLOCK_M: int, BLOCK_N: int, compressed_val=0):
-    vals, mask = to_sparseblock_with_dense_mask(a, BLOCK_M, BLOCK_N, compressed_val)
-    rowptrs, cols, fastcols = to_fast_bcsr_mask(mask)
-    f = FastBCSR(rowptrs, cols,  fastcols, vals, compressed_val)
-    return f    
 
 
 def to_triton_blocksparse_format(a, BLOCK_M: int, BLOCK_N: int):
@@ -311,7 +326,7 @@ def to_fast_bcsr_mask(a, device='cuda'):
                     end = j
             
         col_segs[2*i] = start
-        col_segs[2*i+1] = end
+        col_segs[2*i+1] = end-start
 
     return (rowptrs, cols, col_segs)
 
