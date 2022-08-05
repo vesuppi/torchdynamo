@@ -2,7 +2,7 @@ import sys
 import torch
 import triton 
 from torchinductor.triton_ops.blocksparse.utils import *
-from torchinductor.triton_ops.blocksparse.exp import kernel
+from torchinductor.triton_ops.blocksparse.exp import exp as kernel
 
 VERBOSE = False
 
@@ -18,7 +18,7 @@ def bench_triton_exp(a):
             assert torch.allclose(torch.exp(a), b_dense), \
                 (torch.exp(a)[0,0], b_dense[0,0])
             for num_warps in [2,4,8]:
-                for num_stages in  [2,3,4]:
+                for num_stages in [2,3,4]:
                     try:
                         ms0, _, _ = triton.testing.do_bench(lambda: kernel(a_mask, a_data), rep=50)
                     except Exception as e:
@@ -38,18 +38,22 @@ def bench_kernel(a, config=''):
     print(config, f'{B}x{M}x{N}', f'{ms0:.4f}', f'{ms1:.4f}', sep='; ')
 
 
-def test_configs(configs):
+def test_shape(shape, configs):
     dtype = torch.float32 
-    for B in [1]:
-        for M in [1024, 2048, 4096]:
-            for N in [1024, 2048, 4096]:
-                a = torch.rand([B, M, N], dtype=dtype, device='cuda')
-                if 'dense' in configs:
-                    bench_kernel(a, 'dense')
-                if 'tril' in configs:
-                    a = torch.tril(a)
-                    a = a.masked_fill_(a == 0, -torch.inf)
-                    bench_kernel(a, 'tril')
+    B, M, N = shape
+    a = torch.rand([B, M, N], dtype=dtype, device='cuda')
+    if 'dense' in configs:
+        bench_kernel(a, 'dense')
+    if 'tril' in configs:
+        a = torch.tril(a)
+        a = a.masked_fill_(a == 0, -torch.inf)
+        bench_kernel(a, 'tril')
+
+
+def test_seqlen_128_to_4K(configs, batch_size=96):
+    for seqlen in [128, 256, 512, 1024, 2048]:
+    #for seqlen in [4096]:
+        test_shape((batch_size, seqlen, seqlen), configs)
 
 
 if '-v' in sys.argv:
@@ -58,8 +62,6 @@ if '-v' in sys.argv:
 
 configs = []
 if '--tril' in sys.argv:
-    configs.append('tril')
+    test_seqlen_128_to_4K(['tril'])
 if '--dense' in sys.argv:
-    configs.append('dense')
-
-test_configs(configs)
+    test_seqlen_128_to_4K(['dense'])

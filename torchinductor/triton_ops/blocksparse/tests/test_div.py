@@ -2,11 +2,11 @@ import sys
 import torch
 import triton 
 from torchinductor.triton_ops.blocksparse.utils import *
-from torchinductor.triton_ops.blocksparse.div import div_colvec as kernel
+from torchinductor.triton_ops.blocksparse.div import div as kernel
 
 VERBOSE = False
 
-def bench_triton_exp(a, b): 
+def bench_triton(a, b): 
     times = []
     for BM in [16, 32, 64]:
         for BN in [16, 32, 64]:
@@ -34,32 +34,34 @@ def bench_triton_exp(a, b):
 def bench_kernel(a, b, config=''):
     B, M, N = a.shape
     ms0, _, _ = triton.testing.do_bench(lambda: a/(b[:, :, None]))
-    ms1 = bench_triton_exp(a, b)
+    ms1 = bench_triton(a, b)
     print(config, f'{B}x{M}x{N}', f'{ms0:.4f}', f'{ms1:.4f}', sep='; ')
 
 
-def test_configs(configs):
+def test_shape(shape, configs):
     dtype = torch.float32 
-    for B in [1]:
-        for M in [1024, 2048, 4096]:
-            for N in [1024, 2048, 4096]:
-                a = torch.rand([B, M, N], dtype=dtype, device='cuda')
-                b = torch.rand([B, M], dtype=dtype, device='cuda')
-                if 'dense' in configs:
-                    bench_kernel(a, b, 'dense')
-                if 'tril' in configs:
-                    a = torch.tril(a)
-                    bench_kernel(a, b, 'tril')
+    B, M, N = shape
+    a = torch.rand([B, M, N], dtype=dtype, device='cuda')
+    b = torch.rand([B, M], dtype=dtype, device='cuda')
+    if 'dense' in configs:
+        bench_kernel(a, b, 'dense')
+    if 'tril' in configs:
+        a = torch.tril(a)
+        bench_kernel(a, b, 'tril')
+
+
+def test_seqlen_128_to_4K(configs, batch_size=96):
+    for seqlen in [128, 256, 512, 1024, 2048]:
+    #for seqlen in [4096]:
+        test_shape((batch_size, seqlen, seqlen), configs)
 
 
 if '-v' in sys.argv:
     VERBOSE = True
 
 
+configs = []
 if '--tril' in sys.argv:
-    test_configs(['tril'])
-
+    test_seqlen_128_to_4K(['tril'])
 if '--dense' in sys.argv:
-    test_configs(['dense'])
-
-
+    test_seqlen_128_to_4K(['dense'])
